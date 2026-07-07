@@ -113,9 +113,10 @@ def bench_cub_top_k_ms(
     """Median ms for CUB DeviceBatchedTopK selection, or None if unsupported.
 
     ``lengths`` (optional) gives per-row valid segment sizes for the variable-length case; it is
-    cast to int64 once (outside timing), as CUB expects int64 segment sizes. Maps FlashInfer's
-    (deterministic, tie_break) onto CUB's requirement modes (tie_break != NONE implies
-    deterministic). Uses a pre-sized, graph-safe workspace.
+    passed straight through as int32 (CUB's segment-size sequence takes int32, matching
+    FlashInfer's lengths dtype). Maps FlashInfer's (deterministic, tie_break) onto CUB's
+    requirement modes (tie_break != NONE implies deterministic). Uses a pre-sized, graph-safe
+    workspace.
     """
     num_rows, seq_len = scores.shape
     if not cub_top_k_supported(seq_len, k, scores.dtype):
@@ -123,18 +124,18 @@ def bench_cub_top_k_ms(
     mod = _cub_topk_module()
     tb = int(tie_break)
     det = bool(deterministic or tb != 0)
-    lengths_i64 = None
+    lengths_i32 = None
     if lengths is not None:
-        lengths_i64 = (
-            lengths if lengths.dtype == torch.int64 else lengths.to(torch.int64)
+        lengths_i32 = (
+            lengths if lengths.dtype == torch.int32 else lengths.to(torch.int32)
         )
     out_idx = torch.empty(num_rows, k, dtype=torch.int32, device=scores.device)
     out_vals = torch.empty(num_rows, k, dtype=scores.dtype, device=scores.device)
-    ws_bytes = mod.cub_topk_workspace_size(scores, lengths_i64, k, det, tb)
+    ws_bytes = mod.cub_topk_workspace_size(scores, lengths_i32, k, det, tb)
     workspace = torch.empty(ws_bytes, dtype=torch.uint8, device=scores.device)
     return bench_median_ms(
         lambda: mod.cub_topk(
-            scores, out_idx, out_vals, lengths_i64, k, det, tb, workspace
+            scores, out_idx, out_vals, lengths_i32, k, det, tb, workspace
         )
     )
 

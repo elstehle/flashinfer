@@ -51,11 +51,11 @@ namespace {
 //   - DetReqT  : determinism requirement holder (not_guaranteed / gpu_to_gpu)
 //   - TieReqT  : tie-break requirement holder (unspecified / prefer_smaller / prefer_larger)
 // Segments live in a padded (num_rows, row_stride) buffer; each row selects top-k over its first
-// `seg_size` elements (fixed == row width, or per-row `d_lengths`, which must be int64). Values are
+// `seg_size` elements (fixed == row width, or per-row `d_lengths`, int32). Values are
 // segment-local indices, so `d_values_out` receives the arg-top-k indices.
 template <typename KeyT, int MaxSeg, int MaxK, typename DetReqT, typename TieReqT>
 cudaError_t cub_topk_maxpairs(const KeyT* d_in, cuda::std::int64_t row_stride,
-                              cuda::std::int64_t num_rows, const cuda::std::int64_t* d_lengths,
+                              cuda::std::int64_t num_rows, const cuda::std::int32_t* d_lengths,
                               cuda::std::int64_t fixed_len, cuda::std::int64_t k, KeyT* d_out_vals,
                               cuda::std::int32_t* d_out_idx, DetReqT det_req, TieReqT tie_req,
                               void* d_temp, size_t& temp_bytes, cudaStream_t stream) {
@@ -98,7 +98,7 @@ cudaError_t cub_topk_maxpairs(const KeyT* d_in, cuda::std::int64_t row_stride,
 // Tie-break large    -> (gpu_to_gpu,     prefer_larger_index)
 template <typename KeyT, int MaxSeg, int MaxK>
 cudaError_t cub_topk_dispatch_req(const KeyT* d_in, cuda::std::int64_t row_stride,
-                                  cuda::std::int64_t num_rows, const cuda::std::int64_t* d_lengths,
+                                  cuda::std::int64_t num_rows, const cuda::std::int32_t* d_lengths,
                                   cuda::std::int64_t fixed_len, cuda::std::int64_t k,
                                   KeyT* d_out_vals, cuda::std::int32_t* d_out_idx,
                                   bool deterministic, cuda::std::int64_t tie_break, void* d_temp,
@@ -135,7 +135,7 @@ inline constexpr int kCubTopkMaxK = 4096;       // >= max runtime k on FlashInfe
 
 template <typename KeyT>
 cudaError_t cub_topk_dispatch(const KeyT* d_in, cuda::std::int64_t row_stride,
-                              cuda::std::int64_t num_rows, const cuda::std::int64_t* d_lengths,
+                              cuda::std::int64_t num_rows, const cuda::std::int32_t* d_lengths,
                               cuda::std::int64_t max_len, cuda::std::int64_t k, KeyT* d_out_vals,
                               cuda::std::int32_t* d_out_idx, bool deterministic,
                               cuda::std::int64_t tie_break, void* d_temp, size_t& temp_bytes,
@@ -162,14 +162,14 @@ void cub_topk_check(TensorView input, TensorView output_indices, TensorView outp
   TVM_FFI_ICHECK(encode_dlpack_dtype(output_values.dtype()) == in_code)
       << "cub_topk output_values dtype must match input dtype";
   if (maybe_lengths.has_value()) {
-    TVM_FFI_ICHECK(encode_dlpack_dtype(maybe_lengths.value().dtype()) == int64_code)
-        << "cub_topk expects int64 lengths (cast on the caller side)";
+    TVM_FFI_ICHECK(encode_dlpack_dtype(maybe_lengths.value().dtype()) == int32_code)
+        << "cub_topk expects int32 lengths (matching FlashInfer's lengths dtype)";
   }
 }
 
 // Query the temp bytes for one dtype.
 template <typename KeyT>
-size_t cub_topk_query_impl(TensorView input, const cuda::std::int64_t* d_lengths,
+size_t cub_topk_query_impl(TensorView input, const cuda::std::int32_t* d_lengths,
                            cuda::std::int64_t k, bool deterministic, cuda::std::int64_t tie_break,
                            cudaStream_t stream) {
   size_t temp_bytes = 0;
@@ -184,7 +184,7 @@ size_t cub_topk_query_impl(TensorView input, const cuda::std::int64_t* d_lengths
 // Size query + run for one dtype, using a graph-safe workspace (or internal alloc when absent).
 template <typename KeyT>
 void cub_topk_exec_impl(TensorView input, TensorView output_indices, TensorView output_values,
-                        const cuda::std::int64_t* d_lengths, cuda::std::int64_t k,
+                        const cuda::std::int32_t* d_lengths, cuda::std::int64_t k,
                         bool deterministic, cuda::std::int64_t tie_break,
                         Optional<TensorView> maybe_workspace, cudaStream_t stream) {
   const cuda::std::int64_t num_rows = input.size(0);
@@ -232,9 +232,9 @@ int64_t cub_topk_workspace_size(TensorView input, Optional<TensorView> maybe_len
   cub_topk_check(input, input, input, maybe_lengths);
   cudaSetDevice(input.device().device_id);
   auto stream = get_stream(input.device());
-  const cuda::std::int64_t* d_lengths =
+  const cuda::std::int32_t* d_lengths =
       maybe_lengths.has_value()
-          ? static_cast<const cuda::std::int64_t*>(maybe_lengths.value().data_ptr())
+          ? static_cast<const cuda::std::int32_t*>(maybe_lengths.value().data_ptr())
           : nullptr;
   const cuda::std::int64_t k = static_cast<cuda::std::int64_t>(top_k);
   const int64_t in_code = encode_dlpack_dtype(input.dtype());
@@ -254,7 +254,7 @@ int64_t cub_topk_workspace_size(TensorView input, Optional<TensorView> maybe_len
 //   input          : (num_rows, max_len) scores, fp32 / fp16 / bf16
 //   output_indices : (num_rows, k) int32  -- arg-top-k indices (segment-local)
 //   output_values  : (num_rows, k), same dtype as input -- selected key values
-//   maybe_lengths  : optional (num_rows,) int64 per-row valid segment sizes; absent => fixed = max_len
+//   maybe_lengths  : optional (num_rows,) int32 per-row valid segment sizes; absent => fixed = max_len
 //   top_k          : k
 //   deterministic  : if true, request gpu_to_gpu determinism (SM90+)
 //   tie_break      : 0 none, 1 prefer smaller index, 2 prefer larger index (1/2 imply deterministic)
@@ -266,9 +266,9 @@ void cub_topk(TensorView input, TensorView output_indices, TensorView output_val
   cub_topk_check(input, output_indices, output_values, maybe_lengths);
   cudaSetDevice(input.device().device_id);
   auto stream = get_stream(input.device());
-  const cuda::std::int64_t* d_lengths =
+  const cuda::std::int32_t* d_lengths =
       maybe_lengths.has_value()
-          ? static_cast<const cuda::std::int64_t*>(maybe_lengths.value().data_ptr())
+          ? static_cast<const cuda::std::int32_t*>(maybe_lengths.value().data_ptr())
           : nullptr;
   const cuda::std::int64_t k = static_cast<cuda::std::int64_t>(top_k);
   const int64_t in_code = encode_dlpack_dtype(input.dtype());
