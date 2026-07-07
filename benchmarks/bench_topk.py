@@ -11,6 +11,7 @@ Optional comparison with SGLang's sgl_kernel implementation.
 """
 
 import argparse
+import functools
 import math
 import os
 from contextlib import contextmanager
@@ -73,6 +74,69 @@ def bench_median_ms(fn) -> float:
         use_cuda_graph=False,
     )
     return float(np.median(measurements))
+
+
+@functools.cache
+def _cub_topk_module():
+    """Lazily JIT-build/load the topk module exposing CUB's DeviceBatchedTopK (PR #9224)."""
+    from flashinfer.jit.topk import gen_topk_module
+
+    return gen_topk_module().build_and_load()
+
+
+@functools.cache
+def _cub_topk_supported_arch() -> bool:
+    # CUB's cluster batched top-k requires thread-block clusters (SM90+).
+    return get_compute_capability(torch.device("cuda"))[0] >= 9
+
+
+def cub_top_k_supported(seq_len: int, k: int, dtype: torch.dtype) -> bool:
+    """Whether the CUB DeviceBatchedTopK path covers this shape/dtype.
+
+    Single loose static ceiling (MaxSeg=1M, MaxK=4096) + fp32/fp16/bf16, SM90+.
+    """
+    return (
+        dtype in (torch.float32, torch.float16, torch.bfloat16)
+        and seq_len <= 1048576
+        and k <= 4096
+        and _cub_topk_supported_arch()
+    )
+
+
+def bench_cub_top_k_ms(
+    scores: torch.Tensor,
+    k: int,
+    deterministic: bool,
+    tie_break: int,
+    lengths: torch.Tensor | None = None,
+) -> float | None:
+    """Median ms for CUB DeviceBatchedTopK selection, or None if unsupported.
+
+    ``lengths`` (optional) gives per-row valid segment sizes for the variable-length case; it is
+    cast to int64 once (outside timing), as CUB expects int64 segment sizes. Maps FlashInfer's
+    (deterministic, tie_break) onto CUB's requirement modes (tie_break != NONE implies
+    deterministic). Uses a pre-sized, graph-safe workspace.
+    """
+    num_rows, seq_len = scores.shape
+    if not cub_top_k_supported(seq_len, k, scores.dtype):
+        return None
+    mod = _cub_topk_module()
+    tb = int(tie_break)
+    det = bool(deterministic or tb != 0)
+    lengths_i64 = None
+    if lengths is not None:
+        lengths_i64 = (
+            lengths if lengths.dtype == torch.int64 else lengths.to(torch.int64)
+        )
+    out_idx = torch.empty(num_rows, k, dtype=torch.int32, device=scores.device)
+    out_vals = torch.empty(num_rows, k, dtype=scores.dtype, device=scores.device)
+    ws_bytes = mod.cub_topk_workspace_size(scores, lengths_i64, k, det, tb)
+    workspace = torch.empty(ws_bytes, dtype=torch.uint8, device=scores.device)
+    return bench_median_ms(
+        lambda: mod.cub_topk(
+            scores, out_idx, out_vals, lengths_i64, k, det, tb, workspace
+        )
+    )
 
 
 def bench_flashinfer_modes(
@@ -201,6 +265,17 @@ def bench_top_k_from_scores(
     result["fast_topk_us"] = fast_topk_ms * 1e3
     result["speedup_vs_flashinfer"] = fi_ms / fast_topk_ms
     set_topk_algo("auto")
+
+    # CUB DeviceBatchedTopK (NVIDIA/cccl PR #9224), matching the FlashInfer selected mode.
+    cub_ms = bench_cub_top_k_ms(scores, k, deterministic, TopKTieBreak.NONE)
+    if cub_ms is not None:
+        result["cub_us"] = cub_ms * 1e3
+        result["speedup_cub_vs_flashinfer"] = fi_ms / cub_ms
+    if compare_tie_break:
+        for suffix, tie_break in TIE_BREAK_VARIANTS:
+            cub_tie_ms = bench_cub_top_k_ms(scores, k, True, tie_break)
+            if cub_tie_ms is not None:
+                result[f"cub_tie_{suffix}_us"] = cub_tie_ms * 1e3
 
     # SGLang comparison (only supports k=2048 and float32)
     if (
@@ -918,6 +993,20 @@ def bench_varlen_transform(
     result["torch_us"] = torch_ms * 1e3
     result["speedup_vs_torch"] = torch_ms / fi_ms
 
+    # CUB DeviceBatchedTopK selection over the same variable lengths, matching the mode. CUB does
+    # the selection only (returns local indices); the FlashInfer columns also do the transform.
+    cub_ms = bench_cub_top_k_ms(
+        scores, k, deterministic, TopKTieBreak.NONE, lengths=lengths
+    )
+    if cub_ms is not None:
+        result["cub_us"] = cub_ms * 1e3
+        result["speedup_cub_vs_flashinfer"] = fi_ms / cub_ms
+    if compare_tie_break:
+        for suffix, tie_break in TIE_BREAK_VARIANTS:
+            cub_tie_ms = bench_cub_top_k_ms(scores, k, True, tie_break, lengths=lengths)
+            if cub_tie_ms is not None:
+                result[f"cub_tie_{suffix}_us"] = cub_tie_ms * 1e3
+
     return result
 
 
@@ -1153,6 +1242,10 @@ def main():
             "NOTE: default top-k sweep includes two extra large-batch/long-vocab "
             "stress cases beyond the original grid"
         )
+        print(
+            "NOTE: CUB = cub::DeviceBatchedTopK (NVIDIA/cccl PR #9224), same mode as FlashInfer; "
+            "n/a when dtype not in {fp32,fp16,bf16}, seq_len>1M, k>4096, or arch<SM90"
+        )
         print("=" * 100)
 
         if show_det_or_tie:
@@ -1173,6 +1266,9 @@ def main():
             header += f" {'torch.det':>12} {'Speedup':>10}"
         if args.compare_sglang:
             header += f" {'SGLang':>12} {'Speedup':>10}"
+        header += f" {'CUB':>12} {'CUBvsFI':>10}"
+        if args.tie_break:
+            header += f" {'CUB(tie-small)':>15} {'CUB(tie-large)':>15}"
         print(header)
         print("-" * len(header))
 
@@ -1236,6 +1332,21 @@ def main():
                     )
                 elif args.compare_sglang and case.k == 2048:
                     line += " (SGLang error)"
+                if "cub_us" in result:
+                    line += (
+                        f" {result['cub_us']:>10.2f}us "
+                        f"{result['speedup_cub_vs_flashinfer']:>9.2f}x"
+                    )
+                else:
+                    line += f" {'n/a':>12} {'n/a':>10}"
+                if args.tie_break:
+                    for suffix in ("small", "large"):
+                        cub_tie = result.get(f"cub_tie_{suffix}_us")
+                        line += (
+                            f" {cub_tie:>13.2f}us"
+                            if cub_tie is not None
+                            else f" {'n/a':>15}"
+                        )
                 print(line)
             except RuntimeError as e:
                 error_label = classify_benchmark_runtime_error(e)
@@ -1634,6 +1745,11 @@ def main():
             "NOTE: torch(mask) masks invalid positions once (outside timing) then "
             "torch.topk, isolating selection cost vs the length-aware kernel"
         )
+        print(
+            "NOTE: CUB(sel) = cub::DeviceBatchedTopK (PR #9224) selection only (local indices; no "
+            "gather/offset transform), same lengths + mode; n/a when dtype not in {fp32,fp16,bf16}, "
+            "seq_len>1M, k>4096, or arch<SM90"
+        )
         if show_det_or_tie:
             if args.deterministic:
                 print(
@@ -1673,6 +1789,9 @@ def main():
             if show_clusters:
                 header += f" {'Clusters':>12} {'vsClusters':>10}"
             header += f" {'torch(mask)':>13} {'Speedup':>9}"
+        header += f" {'CUB(sel)':>12} {'CUBvsFI':>10}"
+        if args.tie_break:
+            header += f" {'CUB(tie-small)':>15} {'CUB(tie-large)':>15}"
         print(header)
         print("-" * len(header))
 
@@ -1743,6 +1862,22 @@ def main():
                             f" {result['torch_us']:>11.2f}us "
                             f"{result['speedup_vs_torch']:>8.2f}x"
                         )
+                    # CUB selection columns (transform-agnostic; identical for page_table/ragged).
+                    if "cub_us" in result:
+                        line += (
+                            f" {result['cub_us']:>10.2f}us "
+                            f"{result['speedup_cub_vs_flashinfer']:>9.2f}x"
+                        )
+                    else:
+                        line += f" {'n/a':>12} {'n/a':>10}"
+                    if args.tie_break:
+                        for suffix in ("small", "large"):
+                            cub_tie = result.get(f"cub_tie_{suffix}_us")
+                            line += (
+                                f" {cub_tie:>13.2f}us"
+                                if cub_tie is not None
+                                else f" {'n/a':>15}"
+                            )
                     print(line)
                 except RuntimeError as e:
                     error_label = classify_benchmark_runtime_error(e)
