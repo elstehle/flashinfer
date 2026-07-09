@@ -79,7 +79,15 @@ cudaError_t cub_topk_maxpairs(const KeyT* d_in, cuda::std::int64_t row_stride,
         cuda::stream_ref{stream}};
 
     if (d_lengths != nullptr) {
-      auto segment_sizes = cuda::args::deferred_sequence{d_lengths, cuda::args::bounds<1, MaxSeg>()};
+      // Hand CUB the real per-call max (max_len == fixed_len) as a runtime upper bound alongside the
+      // loose static MaxSeg ceiling. Without it, DeviceBatchedTopK sizes its cluster launch off the
+      // static bound (MaxSeg=1M), which fails is_single_cta_eligible and forces the wide multi-CTA
+      // cluster path for *every* segment -- overhead that scales with the number of segments. The
+      // runtime bound lets the host pick the cheap single-CTA path for small segments, matching the
+      // immediate/fixed-length path.
+      auto segment_sizes = cuda::args::deferred_sequence{
+          d_lengths, cuda::args::bounds<1, MaxSeg>(),
+          cuda::args::bounds(cuda::std::int32_t{1}, static_cast<cuda::std::int32_t>(fixed_len))};
       return cub::DeviceBatchedTopK::MaxPairs(d_temp, temp_bytes, d_keys_in, d_keys_out, d_values_in,
                                               d_values_out, segment_sizes, k_param, num_segments,
                                               env);
