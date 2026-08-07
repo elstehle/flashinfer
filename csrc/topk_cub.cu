@@ -99,9 +99,15 @@ cudaError_t cub_topk_maxpairs(const KeyT* d_in, cuda::std::int64_t row_stride,
 }
 
 // Map FlashInfer's (deterministic, tie_break) to CUB's acknowledged requirement pairs and dispatch.
-//   tie_break: 0 = none, 1 = prefer smaller index, 2 = prefer larger index (1/2 imply deterministic)
+// Output is always unsorted. CUB's `determinism` axis is *set* determinism (not output ordering):
+// tie_break (prefer_smaller/larger_index) pins the selected set, and CUB acknowledges it only with
+// gpu_to_gpu, so it rides gpu_to_gpu regardless of `deterministic` (post-FlashInfer-#4295 the two
+// are independent). `deterministic` requests gpu_to_gpu set reproducibility for the no-tie case; it
+// does NOT reproduce FlashInfer deterministic=True output ordering (would need a CUB
+// stable/stable_sorted ordering, not yet available).
+//   tie_break: 0 = none, 1 = prefer smaller index, 2 = prefer larger index
 // Non-deterministic  -> (not_guaranteed, unspecified)  [the fast filter path]
-// Deterministic      -> (gpu_to_gpu,     unspecified)
+// Deterministic set  -> (gpu_to_gpu,     unspecified)
 // Tie-break small    -> (gpu_to_gpu,     prefer_smaller_index)
 // Tie-break large    -> (gpu_to_gpu,     prefer_larger_index)
 template <typename KeyT, int MaxSeg, int MaxK>
@@ -264,8 +270,10 @@ int64_t cub_topk_workspace_size(TensorView input, Optional<TensorView> maybe_len
 //   output_values  : (num_rows, k), same dtype as input -- selected key values
 //   maybe_lengths  : optional (num_rows,) int32 per-row valid segment sizes; absent => fixed = max_len
 //   top_k          : k
-//   deterministic  : if true, request gpu_to_gpu determinism (SM90+)
-//   tie_break      : 0 none, 1 prefer smaller index, 2 prefer larger index (1/2 imply deterministic)
+//   deterministic  : if true, request gpu_to_gpu *set* determinism (SM90+); output stays unsorted
+//                    (does NOT reproduce FlashInfer deterministic=True output ordering)
+//   tie_break      : 0 none, 1 prefer smaller index, 2 prefer larger index (pins the selected set;
+//                    runs under gpu_to_gpu, independent of `deterministic`)
 //   maybe_workspace: optional 1D uint8 temp-storage buffer (graph-safe). If absent, allocate/free
 //                    internally via cudaMallocAsync (eager use only).
 void cub_topk(TensorView input, TensorView output_indices, TensorView output_values,

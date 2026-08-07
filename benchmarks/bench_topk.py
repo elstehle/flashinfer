@@ -114,16 +114,22 @@ def bench_cub_top_k_ms(
 
     ``lengths`` (optional) gives per-row valid segment sizes for the variable-length case; it is
     passed straight through as int32 (CUB's segment-size sequence takes int32, matching
-    FlashInfer's lengths dtype). Maps FlashInfer's (deterministic, tie_break) onto CUB's
-    requirement modes (tie_break != NONE implies deterministic). Uses a pre-sized, graph-safe
-    workspace.
+    FlashInfer's lengths dtype). Maps FlashInfer's (deterministic, tie_break) onto CUB's execution
+    requirements. Post-#4295 these are independent: tie_break drives the set-determinism selection
+    (prefer_smaller/larger_index, which CUB acknowledges only under gpu_to_gpu, enforced inside the
+    launcher), while deterministic requests gpu_to_gpu set reproducibility for the no-tie case. CUB
+    output is always unsorted and does not reproduce FlashInfer's deterministic=True output ordering.
+    Uses a pre-sized, graph-safe workspace.
     """
     num_rows, seq_len = scores.shape
     if not cub_top_k_supported(seq_len, k, scores.dtype):
         return None
     mod = _cub_topk_module()
     tb = int(tie_break)
-    det = bool(deterministic or tb != 0)
+    # tie_break no longer implies deterministic (FlashInfer #4295): pass it through as-is. The
+    # launcher still requests gpu_to_gpu for prefer_smaller/larger_index (CUB API requirement),
+    # which is what pins the selected set; deterministic here only affects the no-tie case.
+    det = bool(deterministic)
     lengths_i32 = None
     if lengths is not None:
         lengths_i32 = (
@@ -994,8 +1000,8 @@ def bench_varlen_transform(
     result["torch_us"] = torch_ms * 1e3
     result["speedup_vs_torch"] = torch_ms / fi_ms
 
-    # CUB DeviceBatchedTopK selection over the same variable lengths, matching the mode. CUB does
-    # the selection only (returns local indices); the FlashInfer columns also do the transform.
+    # CUB DeviceBatchedTopK selection over the same variable lengths. CUB does the selection only
+    # (returns local indices, unsorted); the FlashInfer columns also do the transform.
     cub_ms = bench_cub_top_k_ms(
         scores, k, deterministic, TopKTieBreak.NONE, lengths=lengths
     )
@@ -1244,8 +1250,9 @@ def main():
             "stress cases beyond the original grid"
         )
         print(
-            "NOTE: CUB = cub::DeviceBatchedTopK (NVIDIA/cccl PR #9224), same mode as FlashInfer; "
-            "n/a when dtype not in {fp32,fp16,bf16}, seq_len>1M, k>4096, or arch<SM90"
+            "NOTE: CUB = cub::DeviceBatchedTopK (NVIDIA/cccl PR #9224); deterministic-set selection "
+            "with unsorted output (does not reproduce FlashInfer deterministic=True output "
+            "ordering); n/a when dtype not in {fp32,fp16,bf16}, seq_len>1M, k>4096, or arch<SM90"
         )
         print("=" * 100)
 
@@ -1748,8 +1755,9 @@ def main():
         )
         print(
             "NOTE: CUB(sel) = cub::DeviceBatchedTopK (PR #9224) selection only (local indices; no "
-            "gather/offset transform), same lengths + mode; n/a when dtype not in {fp32,fp16,bf16}, "
-            "seq_len>1M, k>4096, or arch<SM90"
+            "gather/offset transform); deterministic-set selection with unsorted output (does not "
+            "reproduce FlashInfer deterministic=True ordering); n/a when dtype not in "
+            "{fp32,fp16,bf16}, seq_len>1M, k>4096, or arch<SM90"
         )
         if show_det_or_tie:
             if args.deterministic:
