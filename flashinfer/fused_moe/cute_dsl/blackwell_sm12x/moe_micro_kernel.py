@@ -125,6 +125,7 @@ from flashinfer.cute_dsl.fp4_common import (
 from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm120_b12x import (
     Sm120B12xBlockScaledDenseGemmKernel as DenseGemmKernel,
 )
+from .moe_activation import gated_activation_f32, is_gated_activation
 
 
 _SF_VEC_SIZE = 16
@@ -366,19 +367,26 @@ class MoEMicroKernel:
         input_scales_are_reciprocal: bool = False,
         fast_math: bool = False,
         activation: str = "silu",
+        swiglu_alpha: float = 1.702,
+        swiglu_beta: float = 1.0,
+        swiglu_limit: float | None = None,
         share_input_across_experts: bool = False,
         share_expert_scales: bool = False,
         single_token: bool = False,
     ):
-        if activation not in {"silu", "relu2"}:
+        if activation not in {"silu", "relu2", "gelu_tanh", "swigluoai_uninterleave"}:
             raise ValueError(f"unsupported activation {activation!r}")
         self._dense_cls = DenseGemmKernel
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
         self.input_scales_are_reciprocal = input_scales_are_reciprocal
-        self.fast_math = fast_math
         self.activation = activation
-        self.is_gated = activation == "silu"
+        self.is_gated = is_gated_activation(activation)
+        # relu2's squared outputs need the exact quantizer and scale math.
+        self.fast_math = bool(fast_math) and self.is_gated
+        self.swiglu_alpha = float(swiglu_alpha)
+        self.swiglu_beta = float(swiglu_beta)
+        self.swiglu_limit = float(swiglu_limit) if swiglu_limit is not None else None
         # For m=1 with a shared input scale, the quantized activation is
         # identical across all K top-k experts. When set, only pair_idx==0
         # does the quantize and all pairs read from a single shared slot
@@ -764,6 +772,9 @@ class MoEMicroKernel:
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
             cluster=[1, 1, 1],
+            # A regular launch beside other stream work can admit only part
+            # of the grid, deadlocking the software grid barriers below.
+            cooperative=True,
             stream=stream,
         )
 
@@ -817,7 +828,7 @@ class MoEMicroKernel:
         _, _, gdim_z = cute.arch.grid_dim()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
-        is_cta_leader = Int32(1) if Int32(tidx) == Int32(0) else Int32(0)
+        is_cta_leader = Int32(Int32(tidx) == Int32(0))
 
         if warp_idx == 0:
             cpasync.prefetch_descriptor(tma_a)
@@ -1866,13 +1877,15 @@ class MoEMicroKernel:
                                     ):
                                         g = alpha_value * gate_slice[elem_idx]
                                         u = alpha_value * up_slice[elem_idx]
-                                        sigmoid_g = cute.arch.rcp_approx(
-                                            cutlass.Float32(1.0)
-                                            + cute.math.exp(
-                                                -g, fastmath=self.fast_math
-                                            ),
+                                        tRS_rD_slice[elem_idx] = gated_activation_f32(
+                                            g,
+                                            u,
+                                            activation=self.activation,
+                                            limit=self.swiglu_limit,
+                                            alpha=self.swiglu_alpha,
+                                            beta=self.swiglu_beta,
+                                            fast_math=self.fast_math,
                                         )
-                                        tRS_rD_slice[elem_idx] = g * sigmoid_g * u
                                 else:
                                     for elem_idx in cutlass.range_constexpr(
                                         cute.size(tRS_rD_slice)

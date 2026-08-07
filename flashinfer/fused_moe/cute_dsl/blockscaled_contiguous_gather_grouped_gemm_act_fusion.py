@@ -20,25 +20,26 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Contiguous Grouped GEMM kernel with Gather and SwiGLU Fusion for MoE workloads on Blackwell GPUs.
+Contiguous grouped GEMM kernel with gather and FC1 activation fusion for MoE
+workloads on Blackwell GPUs.
 
 This module provides a FlashInfer-style API wrapper around the TensorRT-LLM CuteDSL
-grouped GEMM kernel with fused gather and SwiGLU activation designed for MoE GEMM1 layers:
+grouped GEMM kernel with fused gather and activation designed for MoE GEMM1 layers:
 - Input A: (seq_len, k) - original unpermuted tokens (no need for moe_permute!)
-- Input B: (num_experts, 2*intermediate_size, k) - expert gate and up weights interleaved
-- Output C: (permuted_m, intermediate_size) - SwiGLU activated outputs in permuted order
+- Input B: expert projection weights, interleaved for gated activations
+- Output C: activated outputs in permuted order
 
 Key features:
 - NVFP4 x NVFP4 grouped GEMM with FP8 scale factors
 - Fused gather operation using LDGSTS instructions with token_id_mapping
 - Eliminates the need for a separate moe_permute kernel
-- Fused SwiGLU activation in epilogue: output = up * silu(gate)
+- Fused FC1 activation in the epilogue
 - Optional FP4 quantization of output with scale factor generation
 - Persistent tile scheduling with per-expert group mapping
 - Warp specialization for overlapped memory and compute
 - Support for SM100 (Blackwell) architecture
 
-Comparison with Non-Gather SwiGLU Fusion:
+Comparison with non-gather activation fusion:
 - Non-Gather: Requires separate moe_permute kernel, then uses TMA for contiguous A load
 - Gather: Uses LDGSTS to gather A directly using token_id_mapping, no moe_permute needed
 """
@@ -50,6 +51,12 @@ import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 import torch
 
+from flashinfer.tllm_enums import (
+    ActivationType,
+    DEFAULT_SWIGLU_ALPHA,
+    DEFAULT_SWIGLU_BETA,
+    DEFAULT_SWIGLU_LIMIT,
+)
 from flashinfer.utils import get_compute_capability
 from flashinfer.cute_dsl.utils import (
     get_cutlass_dtype,
@@ -57,6 +64,10 @@ from flashinfer.cute_dsl.utils import (
     get_num_sm,
     get_max_active_clusters,
     make_ptr,
+)
+from .moe_utils import (
+    normalize_cute_dsl_moe_activation_type,
+    validate_cute_dsl_moe_situ_config,
 )
 
 from .blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
@@ -75,7 +86,7 @@ def create_gather_gemm_tensors(
     """Create tensors required for gather grouped GEMM.
 
     This function creates the mapping tensors needed for the fused gather operation
-    in GEMM1 with SwiGLU activation.
+    in GEMM1 with fused activation.
 
     Args:
         seq_len: Number of input tokens (original sequence length before routing)
@@ -204,6 +215,7 @@ def _get_compiled_gather_kernel(
     token_id_ptr,
     num_tiles_ptr,
     norm_const_ptr,
+    a_per_token_scale_ptr,
     max_active_clusters: int,
     stream,
     # Dtype parameters (compile-time - IN cache key)
@@ -220,7 +232,14 @@ def _get_compiled_gather_kernel(
     vectorized_f32: bool,
     raster_along_m: bool,
     enable_pdl: bool = True,
+    activation_type: int = ActivationType.Swiglu.value,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
     gated: bool = True,
+    use_a_per_token_scale: bool = False,
 ):
     """Get or compile the gather grouped GEMM with FC1 activation fusion.
 
@@ -236,6 +255,17 @@ def _get_compiled_gather_kernel(
     overhead during autotuning.
     """
     global _gather_kernel_cache
+    normalized_activation_type, expected_gated = normalize_cute_dsl_moe_activation_type(
+        activation_type
+    )
+    if gated != expected_gated:
+        raise ValueError(
+            f"gated={gated} is inconsistent with activation_type "
+            f"{normalized_activation_type!r}"
+        )
+    validate_cute_dsl_moe_situ_config(
+        normalized_activation_type, situ_beta, situ_linear_beta
+    )
 
     # Cache key includes dtype and tactic parameters, NOT problem dimensions
     cache_key = (
@@ -250,7 +280,14 @@ def _get_compiled_gather_kernel(
         vectorized_f32,
         raster_along_m,
         enable_pdl,
+        normalized_activation_type.value,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
+        situ_beta,
+        situ_linear_beta,
         gated,
+        use_a_per_token_scale,
     )
 
     if cache_key not in _gather_kernel_cache:
@@ -263,15 +300,23 @@ def _get_compiled_gather_kernel(
             topk=topk,
             raster_along_m=raster_along_m,
             enable_pdl=enable_pdl,
+            activation_type=normalized_activation_type.value,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
             gated=gated,
+            use_a_per_token_scale=use_a_per_token_scale,
         )
 
         # Compile with runtime parameters - they can vary across calls
         # Order must match wrapper signature:
         # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr, alpha_ptr,
         #  tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr, token_id_mapping_ptr,
-        #  num_non_exiting_tiles_ptr, global_sf_ptr, orig_m, m, n, k, l,
-        #  tile_size, scaling_vector_size, max_active_clusters, stream)
+        #  num_non_exiting_tiles_ptr, global_sf_ptr, a_per_token_scale_ptr,
+        #  orig_m, m, n, k, l, tile_size, scaling_vector_size,
+        #  max_active_clusters, stream)
         compiled_gemm = cute.compile(
             gemm.wrapper,
             a_ptr,
@@ -286,6 +331,7 @@ def _get_compiled_gather_kernel(
             token_id_ptr,
             num_tiles_ptr,
             norm_const_ptr,
+            a_per_token_scale_ptr,
             orig_m,
             permuted_m,
             n,
@@ -316,6 +362,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     out_scale: Optional[torch.Tensor] = None,
     global_scale: Optional[torch.Tensor] = None,
     *,
+    a_per_token_scale: Optional[torch.Tensor] = None,
     topk: int = 8,
     ab_dtype: str = "float4_e2m1fn",
     sf_dtype: str = "float8_e4m3fn",
@@ -327,26 +374,32 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     raster_along_m: bool = False,
     sm_count: Optional[int] = None,
     enable_pdl: bool = True,
+    activation_type: int = ActivationType.Swiglu.value,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
     gated: bool = True,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Blockscaled Contiguous Gather Grouped GEMM with SwiGLU Fusion for MoE workloads.
+    """Blockscaled contiguous gather grouped GEMM with fused FC1 activation.
 
-    Performs grouped matrix multiplication with fused gather and SwiGLU activation:
-    C[row] = up * silu(gate), where [gate, up] = alpha[expert] * (A[token_id] @ B[expert])
+    Performs grouped matrix multiplication with fused gather and activation.
 
     This kernel is designed for Mixture of Experts (MoE) GEMM1 layers where:
     - Input tokens are NOT pre-permuted (no need for moe_permute kernel!)
     - The kernel gathers input tokens using token_id_mapping during LDGSTS load
-    - Each expert has gate and up projection weights interleaved
-    - SwiGLU activation is fused into the GEMM epilogue
+    - Gated activations use interleaved gate and up projection weights
+    - The configured activation is fused into the GEMM epilogue
     - Optional FP4 quantization of output
 
     Args:
         a: Input tensor A (original unpermuted tokens), shape (seq_len, k) for FP4
            stored as (seq_len, k//2) uint8. This is the ORIGINAL unpermuted tensor!
-        b: Weight tensor B (expert gate+up weights), shape (num_experts, 2*intermediate_size, k)
-           for FP4 stored as (num_experts, 2*intermediate_size, k//2) uint8
-           The N dimension contains interleaved gate and up projection weights.
+        b: Weight tensor B. Gated activations use shape
+           (num_experts, 2*intermediate_size, k), stored for FP4 as
+           (num_experts, 2*intermediate_size, k//2) uint8, with interleaved
+           gate and up projection weights.
         a_scale: Scale factors for A in MMA-compatible layout
         b_scale: Scale factors for B in MMA-compatible layout
         alpha: Per-expert scaling factors, shape (num_experts,), float32
@@ -360,6 +413,9 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
              For FP4 output, shape is (permuted_m, intermediate_size//2) uint8.
         out_scale: Optional output scale factor tensor for FP4 quantized output.
         global_scale: Global scale factor for FP4 quantization, shape (1,), float32.
+        a_per_token_scale: Optional per-token row scale for operand A,
+            shape (seq_len,), float32. Indexed by the original token ID and
+            applied before the fused activation.
         topk: Number of experts per token. Default: 8
         ab_dtype: Data type for A and B matrices. Default: "float4_e2m1fn"
         sf_dtype: Data type for scale factors. Default: "float8_e4m3fn"
@@ -370,6 +426,20 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         vectorized_f32: Use vectorized f32x2 operations. Default: True
         raster_along_m: If True, raster tiles along M dimension. Default: False
         sm_count: Number of SMs to use. Default: max available.
+        activation_type: Activation type for the epilogue. Use
+            ActivationType.Swiglu for gated SwiGLU/OAI/SiTU,
+            ActivationType.GegluTanh for tanh-approximate GeGLU, and
+            ActivationType.Relu2 for non-gated mode. Setting situ_beta selects
+            SiTU; swiglu_oai is represented as Swiglu with non-default
+            swiglu_alpha/beta/limit.
+        swiglu_alpha: SwiGLU sigmoid multiplier.
+        swiglu_beta: SwiGLU up-projection bias.
+        swiglu_limit: SwiGLU clamp limit.
+        situ_beta: When set with ActivationType.Swiglu, use the SiTU gate
+            ``beta * tanh(gate / beta) * sigmoid(gate)``.
+        situ_linear_beta: Optional SiTU tanh clamp for the up branch.
+        gated: Whether to run the gated SwiGLU path. If False, run non-gated
+            ReLU2.
 
     Returns:
         Tuple of:
@@ -378,7 +448,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         - out_scale: Output scale factors if c_dtype is FP4, else None
 
     Notes:
-        - Unlike the Non-Gather SwiGLU kernel, this kernel does NOT require moe_permute!
+        - Unlike the non-gather kernel, this kernel does NOT require moe_permute!
         - The A tensor is the original unpermuted input
         - The output is in permuted order (can be fed directly to GEMM2)
         - Use create_gather_gemm_tensors() to create required mapping tensors
@@ -412,6 +482,17 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     # Validate inputs
     assert a.device.type == "cuda", "Input tensors must be on CUDA device"
     assert b.device.type == "cuda", "Input tensors must be on CUDA device"
+    normalized_activation_type, expected_gated = normalize_cute_dsl_moe_activation_type(
+        activation_type
+    )
+    if gated != expected_gated:
+        raise ValueError(
+            f"gated={gated} is inconsistent with activation_type "
+            f"{normalized_activation_type!r}"
+        )
+    validate_cute_dsl_moe_situ_config(
+        normalized_activation_type, situ_beta, situ_linear_beta
+    )
 
     # Get dimensions
     seq_len = a.shape[0]
@@ -424,14 +505,39 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     intermediate_size = n // (2 if gated else 1)
     permuted_m = token_id_mapping.shape[0]
 
+    use_a_per_token_scale = a_per_token_scale is not None
+    if use_a_per_token_scale:
+        if a_per_token_scale.device.type != "cuda":
+            raise ValueError("a_per_token_scale must be on CUDA device")
+        if a_per_token_scale.dtype != torch.float32:
+            raise ValueError("a_per_token_scale must have dtype torch.float32")
+        if not a_per_token_scale.is_contiguous():
+            raise ValueError("a_per_token_scale must be contiguous")
+        if a_per_token_scale.shape != (seq_len,):
+            raise ValueError(
+                f"a_per_token_scale must have shape ({seq_len},), "
+                f"got {tuple(a_per_token_scale.shape)}"
+            )
+
     if n % 128 != 0:
         raise ValueError(f"GEMM1 output dim n={n} must be a multiple of 128.")
+
+    # Check if we're doing FP4 quantization
+    generate_sfc = c_dtype == "float4_e2m1fn"
+    if generate_sfc:
+        if global_scale is None:
+            raise ValueError("global_scale is required when c_dtype is 'float4_e2m1fn'")
+    elif out_scale is not None or global_scale is not None:
+        raise ValueError(
+            "out_scale and global_scale are only supported when "
+            "c_dtype is 'float4_e2m1fn'"
+        )
 
     # Check compute capability
     major, minor = get_compute_capability(a.device)
     if major != 10:
         raise ValueError(
-            f"Blockscaled contiguous gather grouped GEMM with SwiGLU requires SM100 family (Blackwell: SM100, SM103). "
+            f"Blockscaled contiguous gather grouped GEMM requires SM100 family (Blackwell: SM100, SM103). "
             f"Got SM{major}{minor}."
         )
 
@@ -460,12 +566,6 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
             f"sf_vec_size={sf_vec_size}, c_dtype={c_dtype}, mma_tiler_mn={mma_tiler_mn}, "
             f"cluster_shape_mn={cluster_shape_mn}, shape=({permuted_m}, {n}, {k}, {num_experts})"
         )
-
-    # Check if we're doing FP4 quantization
-    generate_sfc = c_dtype == "float4_e2m1fn"
-    if generate_sfc:
-        if global_scale is None:
-            raise ValueError("global_scale is required when c_dtype is 'float4_e2m1fn'")
 
     # Create output tensor if not provided
     if out is None:
@@ -538,6 +638,14 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         norm_const_ptr = None
 
     alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem)
+    if use_a_per_token_scale:
+        a_per_token_scale_ptr = make_ptr(
+            cutlass.Float32,
+            a_per_token_scale.data_ptr(),
+            cute.AddressSpace.gmem,
+        )
+    else:
+        a_per_token_scale_ptr = None
     tile_idx_ptr = make_ptr(
         cutlass.Int32, tile_idx_to_expert_idx.data_ptr(), cute.AddressSpace.gmem
     )
@@ -576,6 +684,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         token_id_ptr=token_id_ptr,
         num_tiles_ptr=num_tiles_ptr,
         norm_const_ptr=norm_const_ptr,
+        a_per_token_scale_ptr=a_per_token_scale_ptr,
         max_active_clusters=max_active_clusters,
         stream=stream,
         # Dtype parameters (compile-time, in cache key)
@@ -591,14 +700,21 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         vectorized_f32=vectorized_f32,
         raster_along_m=raster_along_m,
         enable_pdl=enable_pdl,
+        activation_type=normalized_activation_type.value,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
         gated=gated,
+        use_a_per_token_scale=use_a_per_token_scale,
     )
 
     # Execute kernel with runtime parameters
     # Order must match wrapper signature:
     # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr, alpha_ptr,
     #  tile_idx_ptr, mn_limit_ptr, token_id_ptr, num_tiles_ptr, global_sf_ptr,
-    #  orig_m, m, n, k, l, stream)
+    #  a_per_token_scale_ptr, orig_m, m, n, k, l, stream)
     compiled_gemm(
         a_ptr,
         b_ptr,
@@ -612,6 +728,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         token_id_ptr,
         num_tiles_ptr,
         norm_const_ptr,
+        a_per_token_scale_ptr,
         seq_len,  # orig_m
         permuted_m,
         n,
